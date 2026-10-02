@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>即時台股自選波浪分析</title>
+  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #131722; color: #d1d4dc; margin: 0; padding: 12px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .control-panel { background: #1e222d; padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #2a2e39; display: flex; flex-direction: column; gap: 8px; }
+    .input-row { display: flex; gap: 6px; }
+    input, select, button { background: #2a2e39; color: #fff; border: 1px solid #434651; padding: 8px 10px; border-radius: 4px; font-size: 14px; }
+    input { flex: 1; }
+    button { background: #2962ff; border: none; cursor: pointer; font-weight: bold; }
+    button.del-btn { background: #787b86; }
+    .grid { display: flex; flex-direction: column; gap: 12px; }
+    @media (min-width: 768px) {
+      .grid { display: grid; grid-template-columns: 3fr 1fr; }
+    }
+    #chart-wrapper { width: 100%; height: 380px; position: relative; background: #1e222d; border-radius: 8px; border: 1px solid #2a2e39; }
+    #chart { width: 100%; height: 100%; }
+    .card { background: #1e222d; padding: 16px; border-radius: 8px; border: 1px solid #2a2e39; }
+    .score { font-size: 26px; font-weight: bold; color: #f23645; margin: 6px 0; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; background: #2a2e39; font-size: 12px; margin-bottom: 6px; color: #388bfd; }
+    .level { font-family: monospace; font-size: 14px; margin: 3px 0; }
+    #statusMsg { font-size: 12px; color: #f59e0b; margin-top: 4px; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="control-panel">
+      <!-- API Key 設定 -->
+      <div class="input-row">
+        <input type="password" id="geminiKey" placeholder="貼上你的 Gemini API Key (儲存於本機手機)">
+        <button onclick="saveApiKey()">儲存 Key</button>
+      </div>
+      <!-- 自選股管理 -->
+      <div class="input-row">
+        <select id="stockSelect" onchange="onSelectStock()" style="flex: 2;"></select>
+        <button class="del-btn" onclick="removeCurrentStock()">刪除標的</button>
+      </div>
+      <div class="input-row">
+        <input type="text" id="newStockInput" placeholder="輸入台股代碼 (例: 2493, 2330, 6207)">
+        <button onclick="addNewStock()">加入並分析</button>
+      </div>
+      <div id="statusMsg"></div>
+    </div>
+
+    <div class="grid">
+      <div id="chart-wrapper">
+        <div id="chart"></div>
+      </div>
+      <div class="card">
+        <h3 id="stockTitle" style="font-size: 16px; margin: 0 0 6px 0;">請選擇或輸入標的</h3>
+        <div id="stockScore" class="score">-</div>
+        <div id="stockWave" class="badge">波浪定位：-</div>
+        <div id="stockStatus" style="font-size: 13px; color: #787b86;">-</div>
+        <hr style="border:0; border-top:1px solid #2a2e39; margin: 10px 0;">
+        <h4 style="margin: 4px 0; font-size: 13px; color: #089981;">🛡️️ 預估支撐 (Support)</h4>
+        <div id="supportLevels"></div>
+        <h4 style="margin: 8px 0 4px 0; font-size: 13px; color: #f23645;">⚔️ 預估壓力 (Resistance)</h4>
+        <div id="resistanceLevels"></div>
+        <hr style="border:0; border-top:1px solid #2a2e39; margin: 10px 0;">
+        <p id="rationale" style="font-size: 13px; line-height: 1.5; color: #9da3af; margin: 0;"></p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let chart, candleSeries, ma5Series, ma20Series, ma60Series;
+    let priceLines = [];
+
+    // 本地自選股清單
+    let watchlist = JSON.parse(localStorage.getItem('my_stocks') || '["2493", "2330", "6207"]');
+
+    function showStatus(text) {
+      document.getElementById('statusMsg').innerText = text;
+    }
+
+    function saveApiKey() {
+      const key = document.getElementById('geminiKey').value.trim();
+      if (key) {
+        localStorage.setItem('user_gemini_key', key);
+        showStatus("✅ Gemini API Key 已儲存於本機");
+      }
+    }
+
+    function refreshSelector() {
+      const select = document.getElementById('stockSelect');
+      select.innerHTML = watchlist.map(s => `<option value="${s}">${s}</option>`).join('');
+    }
+
+    function addNewStock() {
+      const input = document.getElementById('newStockInput');
+      let code = input.value.trim().toUpperCase().replace('.TW', '').replace('.TWO', '');
+      if (!code) return;
+      if (!watchlist.includes(code)) {
+        watchlist.push(code);
+        localStorage.setItem('my_stocks', JSON.stringify(watchlist));
+        refreshSelector();
+      }
+      document.getElementById('stockSelect').value = code;
+      input.value = '';
+      fetchAndAnalyze(code);
+    }
+
+    function removeCurrentStock() {
+      const select = document.getElementById('stockSelect');
+      const code = select.value;
+      watchlist = watchlist.filter(item => item !== code);
+      localStorage.setItem('my_stocks', JSON.stringify(watchlist));
+      refreshSelector();
+      if (watchlist.length > 0) {
+        fetchAndAnalyze(watchlist[0]);
+      }
+    }
+
+    function onSelectStock() {
+      const code = document.getElementById('stockSelect').value;
+      if (code) fetchAndAnalyze(code);
+    }
+
+    function initChart() {
+      const container = document.getElementById('chart');
+      chart = LightweightCharts.createChart(container, {
+        width: container.clientWidth,
+        height: container.clientHeight,
+        layout: { background: { color: '#1e222d' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#2a2e39' }, horzLines: { color: '#2a2e39' } },
+        timeScale: { borderColor: '#2a2e39' }
+      });
+
+      // 台股習慣：紅漲綠跌
+      candleSeries = chart.addCandlestickSeries({
+        upColor: '#f23645', downColor: '#089981',
+        borderUpColor: '#f23645', borderDownColor: '#089981',
+        wickUpColor: '#f23645', wickDownColor: '#089981'
+      });
+
+      ma5Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, title: '5MA' });
+      ma20Series = chart.addLineSeries({ color: '#388bfd', lineWidth: 1.5, title: '20MA' });
+      ma60Series = chart.addLineSeries({ color: '#a855f7', lineWidth: 1.5, title: '60MA' });
+
+      window.addEventListener('resize', () => {
+        chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+      });
+    }
+
+    function calculateSMA(data, count) {
+      const result = [];
+      for (let i = 0; i < data.length; i++) {
+        if (i < count - 1) continue;
+        let sum = 0;
+        for (let j = 0; j < count; j++) sum += data[i - j].close;
+        result.push({ time: data[i].time, value: +(sum / count).toFixed(2) });
+      }
+      return result;
+    }
+
+    // 透過 TWSE 官方開放端點抓取日 K
+    async function fetchKlines(code) {
+      const padZero = (n) => n < 10 ? '0' + n : '' + n;
+      const now = new Date();
+      const months = [];
+      
+      for (let i = 0; i < 3; i++) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        months.push(`${d.getFullYear()}${padZero(d.getMonth() + 1)}01`);
+      }
+
+      let allDays = [];
+
+      for (let dateStr of months) {
+        try {
+          const url = `https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=${dateStr}&stockNo=${code}`;
+          const res = await fetch(url);
+          if (!res.ok) continue;
+          const json = await res.json();
+          if (json.stat === "OK" && json.data) {
+            json.data.forEach(r => {
+              const parts = r[0].split('/');
+              const y = parseInt(parts[0], 10) + 1911;
+              const timeStr = `${y}-${parts[1]}-${parts[2]}`;
+              const open = parseFloat(r[3].replace(/,/g, ''));
+              const high = parseFloat(r[4].replace(/,/g, ''));
+              const low = parseFloat(r[5].replace(/,/g, ''));
+              const close = parseFloat(r[6].replace(/,/g, ''));
+              const vol = parseInt(r[1].replace(/,/g, ''), 10);
+              if (!isNaN(open) && !isNaN(close)) {
+                allDays.push({ time: timeStr, open, high, low, close, volume: vol });
+              }
+            });
+          }
+        } catch (e) {}
+      }
+
+      if (allDays.length < 15) {
+        try {
+          const rocYear = now.getFullYear() - 1911;
+          const monthStr = padZero(now.getMonth() + 1);
+          const tpexUrl = `https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d=${rocYear}/${monthStr}&stkno=${code}`;
+          const res = await fetch(tpexUrl);
+          const json = await res.json();
+          if (json.aaData) {
+            json.aaData.forEach(r => {
+              const parts = r[0].split('/');
+              const y = parseInt(parts[0], 10) + 1911;
+              const timeStr = `${y}-${parts[1]}-${parts[2]}`;
+              const open = parseFloat(r[3].replace(/,/g, ''));
+              const high = parseFloat(r[4].replace(/,/g, ''));
+              const low = parseFloat(r[5].replace(/,/g, ''));
+              const close = parseFloat(r[6].replace(/,/g, ''));
+              if (!isNaN(open) && !isNaN(close)) {
+                allDays.push({ time: timeStr, open, high, low, close, volume: 0 });
+              }
+            });
+          }
+        } catch (e) {}
+      }
+
+      const map = new Map();
+      allDays.forEach(item => map.set(item.time, item));
+      const result = Array.from(map.values()).sort((a, b) => a.time.localeCompare(b.time));
+
+      if (result.length < 10) {
+        throw new Error(`查無代碼 ${code} 的交易資料（請確認是否為台股上市櫃代碼）`);
+      }
+      return result;
+    }
+
+    function extractPivots(klines) {
+      const pivots = [];
+      const order = 3;
+      for (let i = order; i < klines.length - order; i++) {
+        const curHigh = klines[i].high;
+        const curLow = klines[i].low;
+        let isHigh = true, isLow = true;
+        for (let j = i - order; j <= i + order; j++) {
+          if (j === i) continue;
+          if (klines[j].high >= curHigh) isHigh = false;
+          if (klines[j].low <= curLow) isLow = false;
+        }
+        if (isHigh) pivots.push({ type: '高點', price: curHigh, date: klines[i].time });
+        if (isLow) pivots.push({ type: '低點', price: curLow, date: klines[i].time });
+      }
+      return pivots.slice(-6);
+    }
+
+    async function requestGemini(apiKey, payload) {
+      const candidateModels = ['gemini-3.8-flash', 'gemini-2.0-flash'];
+      let lastErrMsg = '';
+
+      for (let model of candidateModels) {
+        try {
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: payload }] }],
+              generationConfig: { responseMimeType: "application/json" }
+            })
+          });
+
+          const data = await res.json();
+
+          if (!res.ok) {
+            lastErrMsg = data.error?.message || `HTTP ${res.status}`;
+            continue;
+          }
+
+          const rawText = data.candidates[0].content.parts[0].text;
+          return JSON.parse(rawText);
+        } catch (e) {
+          lastErrMsg = e.message;
+        }
+      }
+      throw new Error(`Google API 拒絕請求: ${lastErrMsg}`);
+    }
+
+    async function fetchAndAnalyze(code) {
+      showStatus(`⏳ 正在連線臺灣證交所取得 ${code} 最新日K線...`);
+      try {
+        const klines = await fetchKlines(code);
+
+        candleSeries.setData(klines);
+        ma5Series.setData(calculateSMA(klines, 5));
+        ma20Series.setData(calculateSMA(klines, 20));
+        ma60Series.setData(calculateSMA(klines, 60));
+        chart.timeScale().fitContent();
+
+        const latest = klines[klines.length - 1];
+        const ma20 = calculateSMA(klines, 20).slice(-1)[0]?.value || latest.close;
+        const ma60 = calculateSMA(klines, 60).slice(-1)[0]?.value || latest.close;
+        const pivots = extractPivots(klines);
+
+        document.getElementById('stockTitle').innerText = `${code} - 最新收盤: ${latest.close}`;
+
+        const apiKey = localStorage.getItem('user_gemini_key') || document.getElementById('geminiKey').value.trim();
+        if (!apiKey) {
+          showStatus("⚠️ K 線已繪製。請在上方輸入 Gemini API Key 儲存，即可自動推算波浪與支撐壓力。");
+          return;
+        }
+
+        showStatus(`🤖 K 線載入成功，Gemini 正在分析量價波浪結構...`);
+        const prompt = `
+你是一位專業台股量化與波浪理論分析師。請針對代碼 ${code} 的結構進行推估：
+- 最新股價: ${latest.close}, 20MA: ${ma20}, 60MA: ${ma60}
+- 近期波段關鍵極值: ${JSON.stringify(pivots)}
+請嚴格以繁體中文與 JSON 輸出：
+{
+  "wave_status": "推測波浪位置 (如：主升第3浪推進、第4浪震盪、B浪反彈等)",
+  "support_levels": [支撐價1, 支撐價2],
+  "resistance_levels": [壓力價1, 壓力價2],
+  "sentiment": "強勢多頭 / 震盪整理 / 偏空防守",
+  "score": 1到10數字 (買進評分),
+  "rationale": "一句話簡析目前量價與關鍵防守點"
+}`;
+
+        const analysis = await requestGemini(apiKey, prompt);
+
+        // 渲染分析
+        document.getElementById('stockScore').innerText = `${analysis.score} 分`;
+        document.getElementById('stockWave').innerText = analysis.wave_status;
+        document.getElementById('stockStatus').innerText = `格局：${analysis.sentiment}`;
+        document.getElementById('rationale').innerText = analysis.rationale;
+        document.getElementById('supportLevels').innerHTML = analysis.support_levels.map(p => `<div class="level" style="color: #089981;">$ ${p}</div>`).join('');
+        document.getElementById('resistanceLevels').innerHTML = analysis.resistance_levels.map(p => `<div class="level" style="color: #f23645;">$ ${p}</div>`).join('');
+
+        // 畫出支撐壓力線
+        priceLines.forEach(l => candleSeries.removePriceLine(l));
+        priceLines = [];
+        analysis.support_levels.forEach(p => priceLines.push(candleSeries.createPriceLine({ price: Number(p), color: '#089981', lineWidth: 1, lineStyle: 2, title: '支撐' })));
+        analysis.resistance_levels.forEach(p => priceLines.push(candleSeries.createPriceLine({ price: Number(p), color: '#f23645', lineWidth: 1, lineStyle: 2, title: '壓力' })));
+
+        showStatus("✅ 分析完成");
+      } catch (err) {
+        showStatus(`❌ 錯誤: ${err.message}`);
+      }
+    }
+
+    window.onload = () => {
+      initChart();
+      const savedKey = localStorage.getItem('user_gemini_key');
+      if (savedKey) document.getElementById('geminiKey').value = savedKey;
+      refreshSelector();
+      if (watchlist.length > 0) fetchAndAnalyze(watchlist[0]);
+    };
+  </script>
+</body>
+</html>
